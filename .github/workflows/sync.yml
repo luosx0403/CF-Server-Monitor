@@ -1,67 +1,157 @@
 name: Safe Upstream Sync
 
 on:
-  # 每天自动检查一次上游
+  # 每 6 小时检查一次上游。
+  # GitHub Actions cron 使用 UTC。
+  # 这里对应台湾时间约 02:17、08:17、14:17、20:17。
+  # 故意避开整点，降低 GitHub Actions 定时任务高峰延迟概率。
   schedule:
-    - cron: "17 3 * * *"
+    - cron: "17 0,6,12,18 * * *"
 
-  # 也允许在 GitHub Actions 页面手动点 Run workflow
+  # 允许在 GitHub Actions 页面手动执行。
   workflow_dispatch:
 
-# 只给同步所必需的仓库写权限
+# contents: write
+#   用于将合并后的上游更新 push 回 fork/main。
+#
+# actions: write
+#   用于同步成功后显式触发 deploy.yml。
+#   使用 GITHUB_TOKEN 产生的 git push 默认不会再次触发另一个
+#   on: push workflow，因此必须显式 workflow_dispatch。
 permissions:
   contents: write
   actions: write
 
-# 防止两次同步同时运行
+# 防止多次自动同步同时修改 main。
 concurrency:
-  group: safe-upstream-sync
+  group: safe-upstream-sync-main
   cancel-in-progress: false
 
 jobs:
   sync:
-    name: Sync upstream with local TW flag protection
+    name: Sync upstream and preserve local TW flag policy
 
-    # 只在 fork 上运行
+    # 仅允许在 fork 仓库中执行。
     if: ${{ github.event.repository.fork }}
 
     runs-on: ubuntu-latest
 
     steps:
+      # ------------------------------------------------------------
+      # 1. Checkout 当前 fork/main
+      # ------------------------------------------------------------
+      #
       # actions/checkout v7.0.1
-      # 固定完整 commit SHA，避免 tag 被重新指向其他代码
+      # 固定完整 commit SHA，而不是 @v7，
+      # 减少第三方 Action tag 被移动造成的供应链风险。
+      #
       - name: Checkout fork
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: main
           fetch-depth: 0
+          persist-credentials: true
 
+      # ------------------------------------------------------------
+      # 2. 配置 Git 身份
+      # ------------------------------------------------------------
       - name: Configure Git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Fetch upstream
-        run: |
-          git remote add upstream https://github.com/huilang-me/CF-Server-Monitor.git
-          git fetch upstream main --prune
-
-      - name: Merge upstream
         run: |
           set -euo pipefail
 
-          echo "Local HEAD:"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # ------------------------------------------------------------
+      # 3. 添加并获取官方上游
+      # ------------------------------------------------------------
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+
+          # 如果 remote 已存在就更新地址，否则新建。
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream \
+              https://github.com/huilang-me/CF-Server-Monitor.git
+          else
+            git remote add upstream \
+              https://github.com/huilang-me/CF-Server-Monitor.git
+          fi
+
+          git fetch upstream main --prune
+
+          echo "Fork HEAD:"
           git rev-parse HEAD
 
           echo "Upstream HEAD:"
           git rev-parse upstream/main
 
-          # 正常三方合并。
-          # 如果上游与本地修正发生冲突，本步骤立即失败，
-          # 因而后面的 git push 根本不会发生。
-          git merge --no-edit upstream/main
+      # ------------------------------------------------------------
+      # 4. 合并 upstream/main
+      # ------------------------------------------------------------
+      #
+      # 使用正常 Git 三方 merge。
+      #
+      # 如果上游修改与我们的长期本地修正发生真正冲突，
+      # git merge 会直接退出失败。
+      #
+      # 这比 reset --hard 安全，因为绝不能让上游静默覆盖：
+      #
+      #   public/flags/tw.svg
+      #   TW -> tw 映射修正
+      #   本 sync workflow
+      #
+      - name: Merge upstream
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
 
+          BEFORE_SHA="$(git rev-parse HEAD)"
+
+          echo "Before merge: ${BEFORE_SHA}"
+
+          git merge \
+            --no-edit \
+            --no-ff \
+            upstream/main
+
+          AFTER_SHA="$(git rev-parse HEAD)"
+
+          echo "After merge:  ${AFTER_SHA}"
+
+          if [ "${BEFORE_SHA}" = "${AFTER_SHA}" ]; then
+            echo "No upstream changes."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Upstream changes merged."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ------------------------------------------------------------
+      # 5. 检查国旗资源与 TW 映射
+      # ------------------------------------------------------------
+      #
+      # 这里不只是检查某一行 patch，
+      # 而是检查我们真正需要永久维持的结果：
+      #
+      #   TW
+      #    ↓
+      #   tw
+      #    ↓
+      #   /flags/tw.svg
+      #    ↓
+      #   国旗资源
+      #
+      # 如果上游未来再次：
+      #
+      #   TW -> cn
+      #
+      # 或把 tw.svg 替换成 cn SVG，
+      # workflow 会在 push 之前立即失败。
+      #
       - name: Verify TW flag policy
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -72,105 +162,330 @@ jobs:
 
           errors = []
 
-          # ------------------------------------------------------------
-          # ------------------------------------------------------------
+          # ========================================================
+          # A. 检查 public/flags/tw.svg
+          # ========================================================
 
           svg_path = Path("public/flags/tw.svg")
 
           if not svg_path.is_file():
-              errors.append("public/flags/tw.svg 不存在")
+              errors.append(
+                  "Missing required file: public/flags/tw.svg"
+              )
           else:
-              svg = svg_path.read_text(encoding="utf-8")
+              svg = svg_path.read_text(
+                  encoding="utf-8",
+                  errors="strict"
+              )
 
+              # 正常 TW SVG 应标记为 flag-icons-tw。
               if 'id="flag-icons-tw"' not in svg:
                   errors.append(
-                      "public/flags/tw.svg 不再包含 id=\"flag-icons-tw\""
+                      'public/flags/tw.svg does not contain '
+                      'id="flag-icons-tw"'
                   )
 
+              # 绝不能再把 cn SVG 内容塞进 tw.svg。
               if 'id="flag-icons-cn"' in svg:
                   errors.append(
-                      "public/flags/tw.svg 被检测到包含 flag-icons-cn"
+                      'public/flags/tw.svg contains '
+                      'id="flag-icons-cn"'
                   )
 
-              # 中华民国国旗原始 SVG 的蓝色左上角
-              if '#000095' not in svg:
+              # 该仓库历史上的国旗资源使用 #000095
+              # 作为青天白日区域的蓝色。
+              if "#000095" not in svg.lower():
                   errors.append(
-                      "public/flags/tw.svg 缺少预期的蓝色旗面元素"
+                      "public/flags/tw.svg does not contain "
+                      "the expected ROC flag blue (#000095)"
                   )
 
-          # ------------------------------------------------------------
-          # ------------------------------------------------------------
+              # 历史资源应包含白日相关圆形结构。
+              if "<circle" not in svg:
+                  errors.append(
+                      "public/flags/tw.svg is missing expected "
+                      "ROC flag circle elements"
+                  )
+
+          # ========================================================
+          # B. 检查 src/frontend/utils/api.js
+          # ========================================================
 
           api_path = Path("src/frontend/utils/api.js")
 
           if not api_path.is_file():
-              errors.append("src/frontend/utils/api.js 不存在")
+              errors.append(
+                  "Missing required file: "
+                  "src/frontend/utils/api.js"
+              )
           else:
-              api = api_path.read_text(encoding="utf-8")
+              api = api_path.read_text(
+                  encoding="utf-8",
+                  errors="strict"
+              )
 
+              # 当前架构必须仍然存在这个 resolver。
+              if "getFlagRegionCode" not in api:
+                  errors.append(
+                      "getFlagRegionCode no longer exists in "
+                      "src/frontend/utils/api.js; upstream may "
+                      "have changed the flag architecture and "
+                      "manual review is required"
+                  )
+
+              # 检查几种可能重新引入 TW -> CN 的写法。
               bad_patterns = [
-                  r"""if\s*\(\s*code\s*===\s*['"]TW['"]\s*\)\s*return\s*['"]cn['"]""",
-                  r"""if\s*\(\s*region\s*===\s*['"]TW['"]\s*\)\s*return\s*['"]cn['"]""",
-                  r"""['"]TW['"]\s*:\s*['"]cn['"]""",
+                  # if (code === 'TW') return 'cn'
+                  r"""
+                  if\s*
+                  \(
+                      \s*code\s*===?\s*['"]TW['"]\s*
+                  \)
+                  \s*
+                  (?:\{\s*)?
+                  return\s+['"]cn['"]
+                  """,
+
+                  # if (region === 'TW') return 'cn'
+                  r"""
+                  if\s*
+                  \(
+                      \s*region\s*===?\s*['"]TW['"]\s*
+                  \)
+                  \s*
+                  (?:\{\s*)?
+                  return\s+['"]cn['"]
+                  """,
+
+                  # TW: 'cn'
+                  r"""
+                  ['"]?TW['"]?
+                  \s*:\s*
+                  ['"]cn['"]
+                  """,
+
+                  # TW => cn 之类比较直接的映射表达
+                  r"""
+                  ['"]TW['"]
+                  .*?
+                  ['"]cn['"]
+                  """,
               ]
 
               for pattern in bad_patterns:
-                  if re.search(pattern, api, re.IGNORECASE):
+                  if re.search(
+                      pattern,
+                      api,
+                      flags=(
+                          re.IGNORECASE
+                          | re.VERBOSE
+                          | re.DOTALL
+                      )
+                  ):
                       errors.append(
-                          "src/frontend/utils/api.js 检测到 TW -> cn 映射"
+                          "Detected a possible TW -> cn flag "
+                          "mapping in src/frontend/utils/api.js"
                       )
                       break
 
-          # ------------------------------------------------------------
-          # ------------------------------------------------------------
+              # 检查正常 fallback 仍是 ISO code 小写。
+              #
+              # 当前实现应类似：
+              #
+              # return code.toLowerCase()
+              #
+              if not re.search(
+                  r"return\s+code\.toLowerCase\(\)",
+                  api
+              ):
+                  errors.append(
+                      "Expected `return code.toLowerCase()` "
+                      "was not found. Upstream may have changed "
+                      "flag resolution logic; manual review is "
+                      "required."
+                  )
+
+          # ========================================================
+          # C. 检查整个前端源码是否重新出现明显 TW -> CN 映射
+          # ========================================================
+
+          frontend_root = Path("src/frontend")
+
+          if frontend_root.is_dir():
+              suspicious = []
+
+              for path in frontend_root.rglob("*"):
+                  if not path.is_file():
+                      continue
+
+                  if path.suffix.lower() not in {
+                      ".js",
+                      ".ts",
+                      ".vue",
+                      ".jsx",
+                      ".tsx",
+                  }:
+                      continue
+
+                  try:
+                      text = path.read_text(
+                          encoding="utf-8",
+                          errors="strict"
+                      )
+                  except UnicodeDecodeError:
+                      continue
+
+                  patterns = [
+                      r"""TW['"]?\s*[:=]+\s*['"]cn['"]""",
+                      r"""code\s*===?\s*['"]TW['"].{0,120}return\s*['"]cn['"]""",
+                      r"""region\s*===?\s*['"]TW['"].{0,120}return\s*['"]cn['"]""",
+                  ]
+
+                  for pattern in patterns:
+                      if re.search(
+                          pattern,
+                          text,
+                          flags=re.IGNORECASE | re.DOTALL
+                      ):
+                          suspicious.append(str(path))
+                          break
+
+              if suspicious:
+                  errors.append(
+                      "Possible TW -> CN mapping detected in: "
+                      + ", ".join(sorted(set(suspicious)))
+                  )
+
+          # ========================================================
+          # D. 输出结果
+          # ========================================================
 
           if errors:
               print()
-              print("TW flag policy verification FAILED:")
+              print("=" * 72)
+              print("TW FLAG POLICY VERIFICATION FAILED")
+              print("=" * 72)
+
               for error in errors:
-                  print(f"  - {error}")
+                  print(f"[ERROR] {error}")
+
               print()
-              print("上游更新没有被推送到 fork。")
+              print(
+                  "The upstream merge has NOT been pushed "
+                  "to the fork."
+              )
+              print(
+                  "The currently deployed production version "
+                  "remains unchanged."
+              )
+              print()
+
               sys.exit(1)
 
-          print("TW flag policy verification PASSED")
-          print("TW -> tw.svg")
+          print()
+          print("=" * 72)
+          print("TW FLAG POLICY VERIFICATION PASSED")
+          print("=" * 72)
+          print("TW -> tw")
           print("public/flags/tw.svg -> flag-icons-tw")
+          print("No TW -> cn mapping detected")
+          print()
           PY
 
-      - name: Build test
-        run: |
-          set -euo pipefail
+      # ------------------------------------------------------------
+      # 6. 安装依赖
+      # ------------------------------------------------------------
+      #
+      # 使用 npm ci 而不是 npm install，
+      # 严格依据 package-lock.json 构建。
+      #
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
 
-          npm ci
-          npm run build:frontend
+      - name: Install dependencies
+        run: npm ci
 
+      # ------------------------------------------------------------
+      # 7. 构建测试
+      # ------------------------------------------------------------
+      #
+      # 如果上游虽然 merge 成功，但导致前端无法构建，
+      # 不允许 push 到生产分支。
+      #
+      - name: Build frontend
+        run: npm run build:frontend
+
+      # ------------------------------------------------------------
+      # 8. Push 合并后的 main
+      # ------------------------------------------------------------
+      #
+      # 只有：
+      #
+      #   merge 成功
+      #   TW policy 验证成功
+      #   npm ci 成功
+      #   frontend build 成功
+      #
+      # 才允许执行这个步骤。
+      #
       - name: Push merged upstream
         id: push
+        if: steps.merge.outputs.changed == 'true'
+        shell: bash
         run: |
           set -euo pipefail
 
-          if git diff --quiet origin/main..HEAD; then
-              echo "Already up to date."
-              echo "changed=false" >> "$GITHUB_OUTPUT"
-              exit 0
-          fi
+          echo "Pushing verified upstream merge..."
 
           git push origin HEAD:main
 
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
+      # ------------------------------------------------------------
+      # 9. 没有上游更新时输出说明
+      # ------------------------------------------------------------
+      - name: No upstream changes
+        if: steps.merge.outputs.changed != 'true'
+        run: |
+          echo "Fork is already up to date with upstream."
+          echo "No push and no Cloudflare deployment required."
+
+      # ------------------------------------------------------------
+      # 10. 显式触发 deploy.yml
+      # ------------------------------------------------------------
+      #
+      # 非常重要：
+      #
+      # GitHub Actions 使用 GITHUB_TOKEN 执行的 git push，
+      # 默认不会触发另一个 on: push workflow。
+      #
+      # 因此不能依赖上面的 git push 自动启动 deploy.yml。
+      #
+      # 这里主动使用 workflow_dispatch：
+      #
+      #   sync.yml
+      #       ↓
+      #   push verified main
+      #       ↓
+      #   gh workflow run deploy.yml
+      #       ↓
+      #   Cloudflare Workers deployment
+      #
       - name: Trigger Cloudflare deployment
         if: steps.push.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           set -euo pipefail
+
+          echo "Triggering deploy.yml on main..."
 
           gh workflow run deploy.yml \
             --repo "${{ github.repository }}" \
             --ref main
 
-          echo "Triggered deploy.yml for main"
-
-          git push origin HEAD:main
+          echo "deploy.yml successfully dispatched."
