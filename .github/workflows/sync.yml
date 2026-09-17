@@ -1,40 +1,156 @@
-name: Upstream Sync
+name: Safe Upstream Sync
 
+on:
+  # 每天自动检查一次上游
+  schedule:
+    - cron: "17 3 * * *"
+
+  # 也允许在 GitHub Actions 页面手动点 Run workflow
+  workflow_dispatch:
+
+# 只给同步所必需的仓库写权限
 permissions:
   contents: write
 
-on:
-  schedule:
-    - cron: "0 0 * * *" # every day
-  workflow_dispatch:
+# 防止两次同步同时运行
+concurrency:
+  group: safe-upstream-sync
+  cancel-in-progress: false
 
 jobs:
-  sync_latest_from_upstream:
-    name: Sync latest commits from upstream repo
-    runs-on: ubuntu-latest
+  sync:
+    name: Sync upstream with local TW flag protection
+
+    # 只在 fork 上运行
     if: ${{ github.event.repository.fork }}
 
+    runs-on: ubuntu-latest
+
     steps:
-      # Step 1: run a standard checkout action
-      - name: Checkout target repo
-        uses: actions/checkout@v3
-
-      # Step 2: run the sync action
-      - name: Sync upstream changes
-        id: sync
-        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+      # actions/checkout v7.0.1
+      # 固定完整 commit SHA，避免 tag 被重新指向其他代码
+      - name: Checkout fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          upstream_sync_repo: huilang-me/CF-Server-Monitor
-          upstream_sync_branch: main
-          target_sync_branch: main
-          target_repo_token: ${{ secrets.GITHUB_TOKEN }} # automatically generated, no need to set
+          ref: main
+          fetch-depth: 0
 
-          # Set test_mode true to run tests instead of the true action!!
-          test_mode: false
-
-      - name: Sync check
-        if: failure()
+      - name: Configure Git
         run: |
-          echo "[Error] 由于上游仓库的 workflow 文件变更，导致 GitHub 自动暂停了本次自动更新，请前往仓库页面手动执行 Sync Fork 操作。"
-          echo "[Error] Due to a change in the workflow file of the upstream repository, GitHub has automatically suspended the scheduled automatic update. You need to manually sync your fork."
-          exit 1
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/huilang-me/CF-Server-Monitor.git
+          git fetch upstream main --prune
+
+      - name: Merge upstream
+        run: |
+          set -euo pipefail
+
+          echo "Local HEAD:"
+          git rev-parse HEAD
+
+          echo "Upstream HEAD:"
+          git rev-parse upstream/main
+
+          # 正常三方合并。
+          # 如果上游与本地修正发生冲突，本步骤立即失败，
+          # 因而后面的 git push 根本不会发生。
+          git merge --no-edit upstream/main
+
+      - name: Verify TW flag policy
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          errors = []
+
+          # ------------------------------------------------------------
+          # ------------------------------------------------------------
+
+          svg_path = Path("public/flags/tw.svg")
+
+          if not svg_path.is_file():
+              errors.append("public/flags/tw.svg 不存在")
+          else:
+              svg = svg_path.read_text(encoding="utf-8")
+
+              if 'id="flag-icons-tw"' not in svg:
+                  errors.append(
+                      "public/flags/tw.svg 不再包含 id=\"flag-icons-tw\""
+                  )
+
+              if 'id="flag-icons-cn"' in svg:
+                  errors.append(
+                      "public/flags/tw.svg 被检测到包含 flag-icons-cn"
+                  )
+
+              # 中华民国国旗原始 SVG 的蓝色左上角
+              if '#000095' not in svg:
+                  errors.append(
+                      "public/flags/tw.svg 缺少预期的蓝色旗面元素"
+                  )
+
+          # ------------------------------------------------------------
+          # ------------------------------------------------------------
+
+          api_path = Path("src/frontend/utils/api.js")
+
+          if not api_path.is_file():
+              errors.append("src/frontend/utils/api.js 不存在")
+          else:
+              api = api_path.read_text(encoding="utf-8")
+
+              bad_patterns = [
+                  r"""if\s*\(\s*code\s*===\s*['"]TW['"]\s*\)\s*return\s*['"]cn['"]""",
+                  r"""if\s*\(\s*region\s*===\s*['"]TW['"]\s*\)\s*return\s*['"]cn['"]""",
+                  r"""['"]TW['"]\s*:\s*['"]cn['"]""",
+              ]
+
+              for pattern in bad_patterns:
+                  if re.search(pattern, api, re.IGNORECASE):
+                      errors.append(
+                          "src/frontend/utils/api.js 检测到 TW -> cn 映射"
+                      )
+                      break
+
+          # ------------------------------------------------------------
+          # ------------------------------------------------------------
+
+          if errors:
+              print()
+              print("TW flag policy verification FAILED:")
+              for error in errors:
+                  print(f"  - {error}")
+              print()
+              print("上游更新没有被推送到 fork。")
+              sys.exit(1)
+
+          print("TW flag policy verification PASSED")
+          print("TW -> tw.svg")
+          print("public/flags/tw.svg -> flag-icons-tw")
+          PY
+
+      - name: Build test
+        run: |
+          set -euo pipefail
+
+          npm ci
+          npm run build:frontend
+
+      - name: Push merged upstream
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet origin/main..HEAD; then
+              echo "Already up to date."
+              exit 0
+          fi
+
+          git push origin HEAD:main
