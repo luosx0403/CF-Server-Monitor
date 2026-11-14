@@ -1,13 +1,7 @@
 name: Deploy to Cloudflare Workers
 
 on:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - '**.md'
-      - '.gitignore'
-      - 'LICENSE'
+  # 已停用自动部署，仅保留手动入口；工作流同时在仓库设置中保持禁用。
   workflow_dispatch:
 
 jobs:
